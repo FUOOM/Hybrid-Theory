@@ -1,0 +1,281 @@
+//+------------------------------------------------------------------+
+//|                  HybridSafeHavenEA_Pro.mq5                       |
+//|               Version 3.22 - Fixed & Integrated                  |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2024"
+#property version   "3.22"
+#property description "Advanced Correlation-Based EA with Volatility Filtering"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Controls\Dialog.mqh>
+#include <Controls\Button.mqh>
+#include <Controls\CheckBox.mqh>
+
+input group "Core Configuration";
+input string Symbol1 = "USDJPY";
+input string Symbol2 = "XAUUSD";
+input int CorrelationPeriod = 20;
+input double CorrelationThreshold = -0.7;
+
+input group "Risk Management";
+input double BaseRiskPercent = 1.0;
+input double HighRiskPercent = 2.0;
+input double MaxDailyRisk = 5.0;
+input double StopLossPips = 50.0;
+input bool UseAutoLotSize = true;
+
+input group "Strategy Parameters";
+input int BuyThreshold = 3;
+input int SellThreshold = -3;
+input int MAPeriod = 50;
+input int VolumePeriod = 20;
+
+input group "Advanced Filters";
+input bool EnableTimeFilter = true;
+input int TradingStartHour = 2;
+input int TradingEndHour = 21;
+input bool UseADRFilter = true;
+input int ADRPeriod = 14;
+input double ADRThreshold = 0.7;
+
+input group "Trailing Stop";
+input int TrailingStopDistance = 50;
+input int TrailingStopStep = 5;
+input bool EnableTrailing = true;
+
+CTrade trade;
+int sym1FastMA, sym1SlowMA, sym2FastMA, sym2SlowMA;
+int sym1MACD, sym2MACD;
+double dailyADR[2];
+CDialog mainDialog;
+CButton btnStart;
+CCheckBox chkRiskMode, chkTimeFilter, chkADRFilter;
+
+bool tradeEnabled = false;
+double dailyRiskUsed = 0.0;
+
+int OnInit()
+{
+    sym1FastMA = iMA(Symbol1, _Period, MAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    sym1SlowMA = iMA(Symbol1, _Period, MAPeriod*2, 0, MODE_SMA, PRICE_CLOSE);
+    sym1MACD = iMACD(Symbol1, _Period, 12, 26, 9, PRICE_CLOSE);
+    sym2FastMA = iMA(Symbol2, _Period, MAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    sym2SlowMA = iMA(Symbol2, _Period, MAPeriod*2, 0, MODE_SMA, PRICE_CLOSE);
+    sym2MACD = iMACD(Symbol2, _Period, 12, 26, 9, PRICE_CLOSE);
+
+    InitializeTradingPanel();
+    CalculateDailyADR(Symbol1);
+    CalculateDailyADR(Symbol2);
+    trade.SetExpertMagicNumber(2024);
+
+    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) { mainDialog.Destroy(reason); }
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    mainDialog.OnEvent(id, lparam, dparam, sparam);
+    if(id == CHARTEVENT_OBJECT_CLICK && sparam == "Start")
+    {
+        tradeEnabled = !tradeEnabled;
+        btnStart.Text(tradeEnabled ? "Stop Trading" : "Start Trading");
+        Print("Trading ", tradeEnabled ? "Enabled" : "Disabled");
+    }
+}
+
+void OnTick()
+{
+    static datetime lastBarTime = 0;
+    datetime currentBarTime = iTime(Symbol1, _Period, 0);
+    if(currentBarTime == lastBarTime || !tradeEnabled) return;
+    lastBarTime = currentBarTime;
+
+    if(dailyRiskUsed >= MaxDailyRisk)
+    {
+        Print("Daily risk limit reached. Trading suspended.");
+        return;
+    }
+    if(EnableTimeFilter && !IsWithinTradingHours()) return;
+    if(UseADRFilter && (!IsValidADR(Symbol1) || !IsValidADR(Symbol2))) return;
+
+    double correlation = CalculateCorrelation();
+    if(correlation < CorrelationThreshold && CheckVolumeSpike(Symbol1) && CheckVolumeSpike(Symbol2))
+    {
+        int score1 = CalculateSignalScore(Symbol1, sym1FastMA, sym1SlowMA, sym1MACD);
+        int score2 = CalculateSignalScore(Symbol2, sym2FastMA, sym2SlowMA, sym2MACD);
+        
+        if(score1 <= SellThreshold && score2 >= BuyThreshold)
+            ExecuteTrade(Symbol1, ORDER_TYPE_SELL);
+        else if(score1 >= BuyThreshold && score2 <= SellThreshold)
+            ExecuteTrade(Symbol1, ORDER_TYPE_BUY);
+    }
+
+    if(EnableTrailing)
+        ManageTrailingStop();
+}
+
+bool IsWithinTradingHours()
+{
+    MqlDateTime currentTime;
+    TimeCurrent(currentTime);
+    return currentTime.hour >= TradingStartHour && currentTime.hour < TradingEndHour;
+}
+
+bool IsValidADR(string symbol)
+{
+    int index = (symbol == Symbol1) ? 0 : 1;
+    double range = iHigh(symbol, PERIOD_D1, 0) - iLow(symbol, PERIOD_D1, 0);
+    return range >= dailyADR[index] * ADRThreshold && range <= dailyADR[index] * (1 + (1 - ADRThreshold));
+}
+
+void CalculateDailyADR(string symbol)
+{
+    double high[], low[];
+    ArraySetAsSeries(high, true); ArraySetAsSeries(low, true);
+    CopyHigh(symbol, PERIOD_D1, 0, ADRPeriod, high);
+    CopyLow(symbol, PERIOD_D1, 0, ADRPeriod, low);
+
+    double sum = 0;
+    for(int i = 0; i < ADRPeriod; i++) sum += high[i] - low[i];
+    int index = (symbol == Symbol1) ? 0 : 1;
+    dailyADR[index] = sum / ADRPeriod;
+}
+
+double CalculateCorrelation()
+{
+    double x[], y[];
+    ArraySetAsSeries(x, true); ArraySetAsSeries(y, true);
+    CopyClose(Symbol1, _Period, 0, CorrelationPeriod, x);
+    CopyClose(Symbol2, _Period, 0, CorrelationPeriod, y);
+    return PearsonCorrelation(x, y);
+}
+
+double PearsonCorrelation(double &x[], double &y[])
+{
+    double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+    int n = ArraySize(x);
+    for(int i = 0; i < n; i++) {
+        sumX += x[i]; sumY += y[i]; sumXY += x[i]*y[i];
+        sumX2 += x[i]*x[i]; sumY2 += y[i]*y[i];
+    }
+    double num = sumXY - (sumX * sumY / n);
+    double den = MathSqrt((sumX2 - (sumX*sumX)/n) * (sumY2 - (sumY*sumY)/n));
+    return (den != 0) ? num / den : 0;
+}
+
+int CalculateSignalScore(string symbol, int fastMA, int slowMA, int macdHandle)
+{
+    double fast[], slow[], macdMain[], macdSignal[];
+    if(CopyBuffer(fastMA, 0, 0, 1, fast) <= 0) return 0;
+    if(CopyBuffer(slowMA, 0, 0, 1, slow) <= 0) return 0;
+    if(CopyBuffer(macdHandle, MAIN_LINE, 0, 2, macdMain) <= 0) return 0;
+    if(CopyBuffer(macdHandle, SIGNAL_LINE, 0, 2, macdSignal) <= 0) return 0;
+
+    double price = iClose(symbol, _Period, 0);
+    int score = 0;
+    score += (price > fast[0]) ? 1 : -1;
+    score += (price > slow[0]) ? 2 : -2;
+    score += (macdMain[0] > macdSignal[0]) ? 1 : -1;
+    score += (macdMain[0] > 0) ? 1 : -1;
+    return score;
+}
+
+void ExecuteTrade(string symbol, ENUM_ORDER_TYPE orderType)
+{
+    if(HasOpenPosition(symbol) || !IsSpreadAcceptable(symbol)) return;
+    double price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+    double lotSize = UseAutoLotSize ? CalculateOptimalLotSize(symbol) : 0.01;
+    double sl = StopLossPips * GetPipValue(symbol);
+    double slPrice = (orderType == ORDER_TYPE_BUY) ? price - sl : price + sl;
+
+    if(trade.PositionOpen(symbol, orderType, lotSize, price, slPrice, 0))
+    {
+        double risk = chkRiskMode.Checked() ? HighRiskPercent : BaseRiskPercent;
+        dailyRiskUsed += risk;
+        Print("Trade executed: ", EnumToString(orderType), " ", lotSize);
+    }
+}
+
+double CalculateOptimalLotSize(string symbol)
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskPercent = chkRiskMode.Checked() ? HighRiskPercent : BaseRiskPercent;
+    double riskAmount = balance * riskPercent / 100.0;
+    double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+
+    if(tickSize == 0 || tickValue == 0) return 0.01;
+    double slMoney = StopLossPips * GetPipValue(symbol) * tickValue / tickSize;
+    double lots = NormalizeDouble(riskAmount / slMoney, 2);
+    return MathMin(lots, GetMaxLotSize(symbol));
+}
+
+double GetMaxLotSize(string symbol)
+{
+    double margin, lotSize = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+    if(!OrderCalcMargin(ORDER_TYPE_BUY, symbol, lotSize, 0, margin)) return 0.1;
+    return (margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE)) ? AccountInfoDouble(ACCOUNT_MARGIN_FREE) / margin * lotSize : lotSize;
+}
+
+bool IsSpreadAcceptable(string symbol)
+{
+    double spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD) * SymbolInfoDouble(symbol, SYMBOL_POINT);
+    return spread <= (2 * GetPipValue(symbol));
+}
+
+double GetPipValue(string symbol)
+{
+    return SymbolInfoDouble(symbol, SYMBOL_POINT);
+}
+
+bool CheckVolumeSpike(string symbol)
+{
+    long volume[]; ArraySetAsSeries(volume, true);
+    CopyTickVolume(symbol, _Period, 0, VolumePeriod+1, volume);
+    long sumVolume = 0;
+    for(int i = 1; i <= VolumePeriod; i++) sumVolume += volume[i];
+    return volume[0] > (sumVolume / VolumePeriod) * 1.5;
+}
+
+void ManageTrailingStop()
+{
+    for(int i = PositionsTotal()-1; i >= 0; i--)
+    {
+        if(PositionGetTicket(i))
+        {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+            double currentSL = PositionGetDouble(POSITION_SL);
+            if(currentSL == 0) continue;
+
+            double newSL = (type == POSITION_TYPE_BUY) ? currentPrice - TrailingStopDistance * GetPipValue(symbol) :
+                                                         currentPrice + TrailingStopDistance * GetPipValue(symbol);
+            if((type == POSITION_TYPE_BUY && newSL > currentSL + TrailingStopStep * GetPipValue(symbol)) ||
+               (type == POSITION_TYPE_SELL && newSL < currentSL - TrailingStopStep * GetPipValue(symbol)))
+                trade.PositionModify(PositionGetTicket(i), newSL, PositionGetDouble(POSITION_TP));
+        }
+    }
+}
+
+bool HasOpenPosition(string symbol)
+{
+    for(int i = 0; i < PositionsTotal(); i++)
+        if(PositionGetTicket(i) && PositionGetString(POSITION_SYMBOL) == symbol)
+            return true;
+    return false;
+}
+
+void InitializeTradingPanel()
+{
+    mainDialog.Create(0, "Pro Trading Panel", 0, 5, 5, 250, 200);
+    btnStart.Create(0, "Start Trading", 0, 10, 10, 120, 30);
+    chkRiskMode.Create(0, "High Risk Mode", 0, 10, 50, 120, 20);
+    chkTimeFilter.Create(0, "Time Filter", 0, 10, 80, 100, 20);
+    chkADRFilter.Create(0, "ADR Filter", 0, 10, 110, 100, 20);
+    chkRiskMode.Checked(false);
+    chkTimeFilter.Checked(EnableTimeFilter);
+    chkADRFilter.Checked(UseADRFilter);
+}
